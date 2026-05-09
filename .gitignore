@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# VS Code
+.vscode/
+
+# MongoDB local data
+data/
+
+# Pyright / Pylance
+pyrightconfig.json
