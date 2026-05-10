@@ -5,16 +5,17 @@ Fires a battery of test queries against the running API and prints
 a colour-coded report.
 
 Start the server first:
-    python api.py          ← recommended (handles Windows event loop)
-  or:
-    uvicorn api:app --reload --port 8000 --loop asyncio
+    python api.py
 
 Then in a second terminal:
     python test_middleware.py
 """
 
 from __future__ import annotations
+
 import sys
+from typing import Any, TypedDict
+
 import requests
 
 BASE = "http://127.0.0.1:8000"
@@ -34,8 +35,15 @@ def colour(text: str, score: float, blocked: bool) -> str:
     return f"{GREEN}{text}{RESET}"
 
 
-# Each case has an "expect_blocked" key so pass/fail is unambiguous
-TEST_CASES: list[dict] = [
+# ─── Typed test case schema ───────────────────────────────────────────────────
+
+class TestCase(TypedDict):
+    label:          str
+    expect_blocked: bool
+    body:           dict[str, Any]
+
+
+TEST_CASES: list[TestCase] = [
     # ── Normal (clean, score = 0.00) ─────────────────────────────────────────
     {
         "label":          "Single employee lookup",
@@ -131,46 +139,39 @@ def run_tests() -> None:
             failed += 1
             continue
 
-        body   = resp.json()
-        score  = float(body.get("threat_score", 0.0))
+        body    = resp.json()
+        score   = float(body.get("threat_score", 0.0))
         flagged = bool(body.get("flagged", False))
-        status  = body.get("status", "?")
-        blocked = (resp.status_code == 403)
+        blocked = resp.status_code == 403
 
-        # Pass condition: expected_blocked matches actual HTTP status
-        ok     = (blocked == tc["expect_blocked"])
-        sym    = "✅" if ok else "❌"
+        ok  = blocked == tc["expect_blocked"]
+        sym = "✅" if ok else "❌"
         if ok:
             passed += 1
         else:
             failed += 1
 
-        score_str  = f"{score:.2f}"
         flag_str   = "⚠️  yes" if flagged else "no"
         status_str = "🚫 blocked" if blocked else "ok"
-
         row = (
-            f"{tc['label']:<42} {score_str:>6}  {flag_str:>8}  "
+            f"{tc['label']:<42} {score:>6.2f}  {flag_str:>8}  "
             f"{status_str:>10}  {sym}"
         )
         print(colour(row, score, blocked))
 
     print(f"{'─'*76}")
-    summary = f"{BOLD}Results: {GREEN}{passed} passed{RESET}{BOLD} / "
-    if failed:
-        summary += f"{RED}{failed} failed{RESET}"
-    else:
-        summary += f"0 failed{RESET}"
-    print(f"\n{summary}\n")
+    result_line = f"{BOLD}Results: {GREEN}{passed} passed{RESET}{BOLD} / "
+    result_line += f"{RED}{failed} failed{RESET}" if failed else f"0 failed{RESET}"
+    print(f"\n{result_line}\n")
 
     # ── Audit stats ───────────────────────────────────────────────────────────
-    stats = requests.get(f"{BASE}/audit/stats", timeout=5).json()
+    stats: dict[str, Any] = requests.get(f"{BASE}/audit/stats", timeout=5).json()
     print(f"{BOLD}Audit stats:{RESET}")
     for k, v in stats.items():
         print(f"  {k:<22}: {v}")
 
-    # ── Last 5 flagged entries ────────────────────────────────────────────────
-    flagged_logs = requests.get(
+    # ── Last flagged entries ──────────────────────────────────────────────────
+    flagged_logs: list[dict[str, Any]] = requests.get(
         f"{BASE}/audit/logs",
         params={"limit": 5, "flagged_only": "true"},
         timeout=5,

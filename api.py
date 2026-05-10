@@ -15,22 +15,21 @@ from __future__ import annotations
 
 import asyncio
 import platform
-from typing import Any
+from typing import Any, Union
 
 # ── Windows event loop fix ────────────────────────────────────────────────────
 # Python 3.8+ on Windows defaults to ProactorEventLoop, which deadlocks
 # pymongo's synchronous blocking sockets inside uvicorn's async worker.
 # Fix: explicitly create and set a SelectorEventLoop before anything else runs.
-# This avoids the deprecated WindowsSelectorEventLoopPolicy (removed in 3.16).
 if platform.system() == "Windows":
     _loop = asyncio.SelectorEventLoop()
     asyncio.set_event_loop(_loop)
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from middleware import execute_query, _db   # _db for /audit/logs
+from middleware import execute_query, get_db
 
 # ─── App ─────────────────────────────────────────────────────────────────────
 
@@ -44,10 +43,10 @@ app = FastAPI(
 # ─── Request / Response models ────────────────────────────────────────────────
 
 class QueryRequest(BaseModel):
-    query_type:     str              = Field(..., pattern="^(READ|UPDATE|DELETE|INSERT)$")
-    query_filter:   dict[str, Any]   = Field(default_factory=dict)
-    user_id:        str              = Field(..., min_length=1)
-    update_payload: dict[str, Any] | None = None
+    query_type:     str                    = Field(..., pattern="^(READ|UPDATE|DELETE|INSERT)$")
+    query_filter:   dict[str, Any]         = Field(default_factory=dict)
+    user_id:        str                    = Field(..., min_length=1)
+    update_payload: Union[dict[str, Any], None] = None
 
 
 class QueryResponse(BaseModel):
@@ -56,7 +55,7 @@ class QueryResponse(BaseModel):
     flagged:      bool
     record_count: int
     hash:         str
-    data:         list[dict[str, Any]] | None = None
+    data:         Union[list[dict[str, Any]], None] = None
 
 
 # ─── Helper ──────────────────────────────────────────────────────────────────
@@ -76,8 +75,8 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "vault-audit"}
 
 
-@app.post("/query", response_model=QueryResponse, tags=["queries"])
-def run_query(payload: QueryRequest, request: Request) -> QueryResponse:
+@app.post("/query", tags=["queries"])
+def run_query(payload: QueryRequest, request: Request) -> Response:
     """
     Submit a query against `sensitive_data`.
     The middleware classifies it, logs it, and either returns results
@@ -110,7 +109,7 @@ def run_query(payload: QueryRequest, request: Request) -> QueryResponse:
             },
         )
 
-    return QueryResponse(**result)
+    return JSONResponse(content=QueryResponse(**result).model_dump())
 
 
 @app.get("/audit/logs", tags=["audit"])
@@ -123,17 +122,16 @@ def get_audit_logs(
     - `limit`        — max entries to return (default 20)
     - `flagged_only` — when true, return only flagged (suspicious) logs
     """
-    collection = _db["audit_logs"]
+    db = get_db()
     filt: dict[str, Any] = {"flagged": True} if flagged_only else {}
     cursor = (
-        collection
+        db["audit_logs"]
         .find(filt, {"_id": 0})
         .sort("timestamp", -1)
         .limit(limit)
     )
     logs: list[dict[str, Any]] = []
     for doc in cursor:
-        # Convert datetime → ISO string so FastAPI can serialize it
         if "timestamp" in doc:
             doc["timestamp"] = doc["timestamp"].isoformat()
         logs.append(doc)
@@ -143,7 +141,8 @@ def get_audit_logs(
 @app.get("/audit/stats", tags=["audit"])
 def get_audit_stats() -> dict[str, Any]:
     """High-level stats over all audit logs."""
-    collection = _db["audit_logs"]
+    db = get_db()
+    collection = db["audit_logs"]
     total   = collection.count_documents({})
     flagged = collection.count_documents({"flagged": True})
     blocked = collection.count_documents({"threat_score": {"$gte": 0.85}})
@@ -171,7 +170,5 @@ if __name__ == "__main__":
         host="127.0.0.1",
         port=8000,
         reload=True,
-        # Explicitly select the asyncio loop so Windows ProactorEventLoop
-        # is never used (pymongo's sync sockets are incompatible with it)
         loop="asyncio",
     )

@@ -36,6 +36,11 @@ _client: MongoClient[dict[str, Any]] = MongoClient("mongodb://localhost:27017/")
 _db: Database[dict[str, Any]] = _client["vault_audit_db"]
 
 
+def get_db() -> Database[dict[str, Any]]:
+    """Public accessor for the database — use this instead of _db directly."""
+    return _db
+
+
 # ─── Feature extraction ───────────────────────────────────────────────────────
 
 SENSITIVE_FIELDS: set[str] = set(THRESHOLDS["sensitive_fields"])
