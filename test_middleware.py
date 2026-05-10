@@ -75,8 +75,8 @@ TEST_CASES: list[TestCase] = [
     },
     # ── Flagged (score ≥ 0.50, not blocked) ──────────────────────────────────
     {
-        "label":          "Full collection scan — flagged",
-        "expect_blocked": False,
+        "label": "Full collection scan — blocked by SVM",
+        "expect_blocked": True,
         "body": {
             "query_type":   "READ",
             "query_filter": {},
