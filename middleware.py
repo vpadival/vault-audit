@@ -11,7 +11,6 @@ Sits between the caller and MongoDB. Every query goes through
 """
 
 from __future__ import annotations
-
 import hashlib
 import json
 import logging
@@ -23,6 +22,7 @@ from pymongo.collection import Collection
 from pymongo.database import Database
 
 from baseline import THRESHOLDS
+import svm_engine                          # Phase 3
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -88,18 +88,14 @@ def extract_features(
 
 def score_threat(features: dict[str, Any]) -> float:
     """
-    Returns a float in [0.0, 1.0].
-    0.0 = benign, 1.0 = certain threat.
-
-    Weight design targets (verified in unit tests):
-      - Normal single-lookup                 → 0.00
-      - Salary-field dump (broad filter)     → 0.45  (flagged, not blocked)
-      - Full collection scan (empty filter)  → 0.85  (blocked)
-      - Bulk DELETE  (empty filter)          → 1.00  (blocked)
-
-    Logic mirrors the baseline thresholds so Phase 3 has a clear
-    target to replicate / improve upon.
+    Phase 3: delegates to the calibrated SVM pipeline when the model is loaded.
+    Falls back to the original rule-based scorer automatically when the model
+    is not available (e.g. CI runs without svm_model.joblib, unit tests).
     """
+    if svm_engine.is_model_loaded():
+        return svm_engine.svm_score(features)
+
+    # ── Fallback: original rule-based scorer (Phase 2) ────────────────────
     score = 0.0
 
     if features["exceeds_limit"]:      # record_count > MAX_SAFE_COUNT

@@ -12,7 +12,6 @@ Run with:
 """
 
 from __future__ import annotations
-
 import asyncio
 import platform
 from typing import Any, Union
@@ -25,18 +24,34 @@ if platform.system() == "Windows":
     _loop = asyncio.SelectorEventLoop()
     asyncio.set_event_loop(_loop)
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from middleware import execute_query, get_db
+import svm_engine                          # Phase 3
 
 # ─── App ─────────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):          # type: ignore[type-arg]
+    try:
+        svm_engine.load_model("svm_model.joblib")
+    except FileNotFoundError:
+        import logging
+        logging.getLogger("vault-audit").warning(
+            "svm_model.joblib not found — rule-based scorer will be used. "
+            "Run train_svm.py to generate the model."
+        )
+    yield
+
 
 app = FastAPI(
     title="Vault-Audit API",
     description="Security middleware for MongoDB — intercepts, scores, and logs every query.",
     version="0.2.0",
+    lifespan=lifespan,
 )
 
 
@@ -67,12 +82,21 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+async def init_db() -> None:
+    """Compatibility stub used by tests; real DB setup happens elsewhere."""
+    return None
+
+
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
 @app.get("/health", tags=["meta"])
-def health() -> dict[str, str]:
+def health() -> dict[str, Any]:
     """Liveness probe."""
-    return {"status": "ok", "service": "vault-audit"}
+    return {
+        "status":  "ok",
+        "service": "vault-audit",
+        "svm":     svm_engine.model_info(),    # Phase 3
+    }
 
 
 @app.post("/query", tags=["queries"])
