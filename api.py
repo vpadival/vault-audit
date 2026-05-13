@@ -89,6 +89,22 @@ async def init_db() -> None:
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
+@app.get("/", tags=["meta"])
+def root() -> dict[str, Any]:
+    """API entry point — links to docs and available endpoints."""
+    return {
+        "service":   "vault-audit",
+        "version":   "0.2.0",
+        "docs":      "/docs",
+        "endpoints": {
+            "health":      "GET  /health",
+            "query":       "POST /query",
+            "audit_logs":  "GET  /audit/logs",
+            "audit_stats": "GET  /audit/stats",
+        },
+    }
+
+
 @app.get("/health", tags=["meta"])
 def health() -> dict[str, Any]:
     """Liveness probe."""
