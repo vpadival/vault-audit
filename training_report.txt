@@ -1,5 +1,5 @@
-        vault-audit  Phase 3 — SVM Training Report
-        ===========================================
+        vault-audit  Phase 3 -- SVM Training Report
+        ============================================
 
         Dataset
         -------
@@ -8,12 +8,12 @@
 
         Model
         -----
-        Pipeline      : StandardScaler → CalibratedClassifierCV(SVC, method=sigmoid, cv=5)
+        Pipeline      : StandardScaler -> CalibratedClassifierCV(SVC, method=sigmoid, cv=5)
         Kernel        : RBF   C=10   gamma=scale   class_weight=balanced
 
         Cross-validation (StratifiedKFold n=5, on train split)
         -------------------------------------------------------
-        Accuracy      : 0.9870 ± 0.0009
+        Accuracy      : 0.9870 +/- 0.0009
 
         Test-set classification report
         ------------------------------
@@ -39,8 +39,8 @@ weighted avg     0.9829    0.9815    0.9817      1080
 
         Thresholds applied in svm_engine.py
         ------------------------------------
-          flagged  : predicted class == 1  OR  P(blocked) >= 0.50
-          blocked  : predicted class == 2
+          flagged  : P(flagged) + P(blocked) >= 0.50
+          blocked  : P(flagged) + P(blocked) >= 0.85
 
         Notes
         -----
