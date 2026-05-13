@@ -17,6 +17,8 @@ import sys
 from typing import Any, TypedDict
 
 import requests
+from pymongo import MongoClient
+from pymongo.collection import Collection
 
 BASE = "http://127.0.0.1:8000"
 
@@ -185,6 +187,121 @@ def run_tests() -> None:
             f"score={entry['threat_score']:.2f}  "
             f"hash={entry['integrity_hash'][:12]}…"
         )
+
+    # ─── Phase 4: chain verification ──────────────────────────────────────────
+    print(f"\n{BOLD}Phase 4 — audit chain verification{RESET}")
+    print("─" * 76)
+    run_chain_tests()
+
+
+# ─── Phase 4: tamper-detection tests ──────────────────────────────────────────
+
+def _verify() -> dict[str, Any]:
+    """Hit GET /audit/verify and return the parsed body."""
+    return requests.get(f"{BASE}/audit/verify", timeout=5).json()
+
+
+def _pass(label: str, ok: bool, detail: str = "") -> tuple[str, bool]:
+    sym    = "✅" if ok else "❌"
+    colour = GREEN if ok else RED
+    line   = f"  {sym} {label}"
+    if detail:
+        line += f"  — {detail}"
+    print(f"{colour}{line}{RESET}")
+    return label, ok
+
+
+def run_chain_tests() -> None:
+    """
+    Three checks:
+      1. Verifier reports clean on the chain produced by the queries above.
+      2. Tampering with one entry's threat_score is detected (direct Mongo write).
+      3. Deleting an entry from the middle is detected.
+
+    The tamper/delete steps go through a direct MongoClient by design — going
+    through the API would just create more legitimate log entries and defeat
+    the test.
+    """
+    client: MongoClient[dict[str, Any]] = MongoClient("mongodb://localhost:27017/")
+    audit_logs: Collection[dict[str, Any]] = client["vault_audit_db"]["audit_logs"]
+
+    results: list[tuple[str, bool]] = []
+
+    # ── 1. Clean chain ────────────────────────────────────────────────────────
+    r = _verify()
+    ok = bool(r.get("valid")) and r.get("first_break_seq") is None
+    results.append(_pass(
+        "Clean chain reports valid",
+        ok,
+        f"total={r.get('total')} valid={r.get('valid')}",
+    ))
+    if not ok:
+        print(f"    {RED}stopping further chain tests — base chain is already broken{RESET}")
+        print(f"    reason: {r.get('reason')}")
+        return
+
+    # ── 2. Tamper one entry's threat_score ────────────────────────────────────
+    # Pick a middle-ish entry so verification has to walk past clean entries first.
+    target = audit_logs.find_one(
+        {"seq": {"$exists": True}},
+        sort=[("seq", 1)],
+        skip=1,  # not the genesis entry
+    )
+    if target is None:
+        results.append(_pass("Tamper test", False, "no entry to tamper with"))
+    else:
+        original_score = float(target["threat_score"])
+        tampered_score = 0.0 if original_score > 0.5 else 0.99
+        audit_logs.update_one(
+            {"_id": target["_id"]},
+            {"$set": {"threat_score": tampered_score}},
+        )
+        r = _verify()
+        detected = (not r.get("valid")) and r.get("first_break_seq") == target["seq"]
+        results.append(_pass(
+            "Tampered threat_score is detected",
+            detected,
+            f"break at seq={r.get('first_break_seq')}  reason={r.get('reason')}",
+        ))
+        # Restore so the next test starts from a known state.
+        audit_logs.update_one(
+            {"_id": target["_id"]},
+            {"$set": {"threat_score": original_score}},
+        )
+        r = _verify()
+        results.append(_pass(
+            "Chain valid again after restore",
+            bool(r.get("valid")),
+            f"valid={r.get('valid')}",
+        ))
+
+    # ── 3. Delete an entry from the middle ────────────────────────────────────
+    victim = audit_logs.find_one({}, sort=[("seq", 1)], skip=1)
+    if victim is None:
+        results.append(_pass("Deletion test", False, "no entry to delete"))
+    else:
+        snapshot = dict(victim)
+        audit_logs.delete_one({"_id": victim["_id"]})
+        r = _verify()
+        detected = (not r.get("valid")) and r.get("first_break_seq") == victim["seq"]
+        results.append(_pass(
+            "Deleted entry is detected",
+            detected,
+            f"break at seq={r.get('first_break_seq')}  reason={r.get('reason')}",
+        ))
+        # Restore so the DB is left as found.
+        audit_logs.insert_one(snapshot)
+        r = _verify()
+        results.append(_pass(
+            "Chain valid again after restore",
+            bool(r.get("valid")),
+            f"valid={r.get('valid')}",
+        ))
+
+    passed = sum(1 for _, ok in results if ok)
+    failed = len(results) - passed
+    print(f"\n  {BOLD}Phase 4: {GREEN}{passed} passed{RESET}{BOLD}, "
+          f"{RED if failed else ''}{failed} failed{RESET}")
 
 
 if __name__ == "__main__":

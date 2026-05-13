@@ -29,7 +29,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from middleware import execute_query, get_db
+from middleware import execute_query, get_db, verify_chain
 import svm_engine                          # Phase 3
 
 # ─── App ─────────────────────────────────────────────────────────────────────
@@ -97,10 +97,11 @@ def root() -> dict[str, Any]:
         "version":   "0.2.0",
         "docs":      "/docs",
         "endpoints": {
-            "health":      "GET  /health",
-            "query":       "POST /query",
-            "audit_logs":  "GET  /audit/logs",
-            "audit_stats": "GET  /audit/stats",
+            "health":       "GET  /health",
+            "query":        "POST /query",
+            "audit_logs":   "GET  /audit/logs",
+            "audit_stats":  "GET  /audit/stats",
+            "audit_verify": "GET  /audit/verify",
         },
     }
 
@@ -199,6 +200,17 @@ def get_audit_stats() -> dict[str, Any]:
         "blocked":          blocked,
         "avg_threat_score": avg_threat,
     }
+
+
+@app.get("/audit/verify", tags=["audit"])
+def get_audit_verify() -> dict[str, Any]:
+    """
+    Phase 4: walk the audit log chain and verify integrity.
+    Returns valid=true on a clean chain, or valid=false with the first
+    broken seq and a human-readable reason.
+    """
+    result = verify_chain()
+    return dict(result)
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────

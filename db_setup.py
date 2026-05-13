@@ -36,9 +36,10 @@ print(f"✅  Inserted {len(employees)} employee records into sensitive_data")
 db.create_collection("audit_logs", validator={
     "$jsonSchema": {
         "bsonType": "object",
-        "required": ["timestamp", "user_id", "query_type", "record_count",
-                     "threat_score", "integrity_hash"],
+        "required": ["seq", "timestamp", "user_id", "query_type", "record_count",
+                     "threat_score", "integrity_hash", "prev_hash"],
         "properties": {
+            "seq":            {"bsonType": "int",    "minimum": 0},
             "timestamp":      {"bsonType": "date"},
             "user_id":        {"bsonType": "string"},
             "query_type":     {"bsonType": "string",
@@ -46,6 +47,7 @@ db.create_collection("audit_logs", validator={
             "record_count":   {"bsonType": "int",    "minimum": 0},
             "threat_score":   {"bsonType": "double", "minimum": 0.0, "maximum": 1.0},
             "integrity_hash": {"bsonType": "string"},
+            "prev_hash":      {"bsonType": "string"},
             # optional extras captured by the middleware later
             "query_filter":   {"bsonType": "object"},
             "ip_address":     {"bsonType": "string"},
@@ -59,6 +61,7 @@ print("✅  Created audit_logs collection with schema validation")
 db.audit_logs.create_index("timestamp")
 db.audit_logs.create_index("user_id")
 db.audit_logs.create_index("threat_score")
+db.audit_logs.create_index("seq", unique=True)    # Phase 4: chain ordering
 db.sensitive_data.create_index("employee_id", unique=True)
 print("✅  Indexes created")
 
