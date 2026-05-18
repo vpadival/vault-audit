@@ -68,7 +68,7 @@ def _rule_score(
     if is_high_risk_op:
         score += 0.30
     if has_sensitive:
-        score += 0.10
+        score += 0.20
     if bulk_sensitive:
         score += 0.05
     return min(score, 1.0)

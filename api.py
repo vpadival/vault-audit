@@ -26,7 +26,8 @@ if platform.system() == "Windows":
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, HTMLResponse
+from pathlib import Path
 from pydantic import BaseModel, Field
 
 from middleware import execute_query, get_db, verify_chain
@@ -98,12 +99,20 @@ def root() -> dict[str, Any]:
         "docs":      "/docs",
         "endpoints": {
             "health":       "GET  /health",
+            "dashboard":    "GET  /dashboard",
             "query":        "POST /query",
             "audit_logs":   "GET  /audit/logs",
             "audit_stats":  "GET  /audit/stats",
             "audit_verify": "GET  /audit/verify",
         },
     }
+
+
+@app.get("/dashboard", tags=["meta"], response_class=HTMLResponse)
+def dashboard() -> HTMLResponse:
+    """Interactive web UI for exploring queries, audit logs, and chain integrity."""
+    html_path = Path(__file__).parent / "dashboard.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
 @app.get("/health", tags=["meta"])
@@ -160,9 +169,11 @@ def get_audit_logs(
 ) -> list[dict[str, Any]]:
     """
     Retrieve recent audit log entries.
-    - `limit`        — max entries to return (default 20)
+    - `limit`        — max entries to return (default 20, max 500)
     - `flagged_only` — when true, return only flagged (suspicious) logs
     """
+    # Clamp limit to prevent accidental full-collection dumps via the API.
+    limit = max(1, min(limit, 500))
     db = get_db()
     filt: dict[str, Any] = {"flagged": True} if flagged_only else {}
     cursor = (

@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, TypedDict
 
@@ -40,7 +41,9 @@ logging.basicConfig(
 log = logging.getLogger("vault-audit")
 
 # ─── MongoDB connection ───────────────────────────────────────────────────────
-_client: MongoClient[dict[str, Any]] = MongoClient("mongodb://localhost:27017/")
+# Override MONGO_URI in production; defaults to localhost for local dev.
+_MONGO_URI: str = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
+_client: MongoClient[dict[str, Any]] = MongoClient(_MONGO_URI)
 _db: Database[dict[str, Any]] = _client["vault_audit_db"]
 
 
@@ -116,11 +119,14 @@ def score_threat(features: dict[str, Any]) -> float:
         score += 0.30
 
     if features["has_sensitive"]:      # ssn / bank_account / salary in filter
-        score += 0.10
+        score += 0.20
 
-    # bulk_sensitive: only fires when BOTH empty filter AND sensitive — small
-    # additive nudge; the two parent signals already cover most of the score
-    if features["bulk_sensitive"] and not features["is_empty_filter"]:
+    # bulk_sensitive: additive nudge when empty filter AND sensitive fields
+    # are both present (is_empty_filter already scored 0.45 above, but
+    # bulk-exfil of sensitive data warrants an extra push toward the block
+    # threshold).  The `not is_empty_filter` guard was incorrect — it made
+    # this branch unreachable — removed.
+    if features["bulk_sensitive"]:
         score += 0.05
 
     return min(round(score, 4), 1.0)
@@ -267,7 +273,14 @@ def verify_chain() -> ChainVerification:
     first_break_seq and reason are None.
     """
     audit_logs: Collection[dict[str, Any]] = _db["audit_logs"]
-    cursor = audit_logs.find({}, {"_id": 0}).sort("seq", 1)
+    # Project only the fields we need — avoids loading query_filter blobs
+    # for every entry when the collection is large.
+    _VERIFY_PROJECTION = {
+        "_id": 0, "seq": 1, "timestamp": 1, "user_id": 1,
+        "query_type": 1, "record_count": 1, "threat_score": 1,
+        "integrity_hash": 1, "prev_hash": 1, "query_filter": 1,
+    }
+    cursor = audit_logs.find({}, _VERIFY_PROJECTION).sort("seq", 1)
 
     expected_seq    = 0
     expected_prev   = GENESIS_PREV_HASH

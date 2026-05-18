@@ -18,7 +18,6 @@ import argparse
 import sys
 from typing import Any
 
-from pymongo import MongoClient
 from pymongo.collection import Collection
 
 from middleware import verify_chain
@@ -35,8 +34,9 @@ def _print_tail(verbose: bool, limit: int = 5) -> None:
     """Print the last few entries so the user can eyeball the chain links."""
     if not verbose:
         return
-    client: MongoClient[dict[str, Any]] = MongoClient("mongodb://localhost:27017/")
-    audit_logs: Collection[dict[str, Any]] = client["vault_audit_db"]["audit_logs"]
+    # Reuse the connection from middleware instead of opening a second one.
+    from middleware import get_db
+    audit_logs: Collection[dict[str, Any]] = get_db()["audit_logs"]
     entries = list(
         audit_logs.find({}, {"_id": 0, "seq": 1, "user_id": 1, "query_type": 1,
                              "prev_hash": 1, "integrity_hash": 1})
