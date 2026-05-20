@@ -72,6 +72,7 @@ class QueryResponse(BaseModel):
     record_count: int
     hash:         str
     data:         Union[list[dict[str, Any]], None] = None
+    reason:       Union[str, None] = None
 
 
 # ─── Helper ──────────────────────────────────────────────────────────────────
@@ -104,6 +105,7 @@ def root() -> dict[str, Any]:
             "audit_logs":   "GET  /audit/logs",
             "audit_stats":  "GET  /audit/stats",
             "audit_verify": "GET  /audit/verify",
+            "audit_attacks": "GET  /audit/attacks",
         },
     }
 
@@ -222,6 +224,29 @@ def get_audit_verify() -> dict[str, Any]:
     """
     result = verify_chain()
     return dict(result)
+
+
+@app.get("/audit/attacks", tags=["audit"])
+def get_audit_attacks(limit: int = 50) -> list[dict[str, Any]]:
+    """
+    Phase 5: return only audit entries that were flagged as injection or
+    rate-limit attacks, newest first.
+    """
+    limit = max(1, min(limit, 500))
+    db = get_db()
+    # threat_score >= 0.85 AND reason indicates attack type
+    cursor = (
+        db["audit_logs"]
+        .find({"threat_score": {"$gte": 0.85}}, {"_id": 0})
+        .sort("timestamp", -1)
+        .limit(limit)
+    )
+    logs: list[dict[str, Any]] = []
+    for doc in cursor:
+        if "timestamp" in doc:
+            doc["timestamp"] = doc["timestamp"].isoformat()
+        logs.append(doc)
+    return logs
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────

@@ -580,6 +580,8 @@
               <button class="btn btn-secondary" onclick="preset('flagged')">Salary dump</button>
               <button class="btn btn-secondary" onclick="preset('blocked')">Bulk DELETE</button>
               <button class="btn btn-secondary" onclick="preset('update')">Single update</button>
+              <button class="btn btn-secondary" onclick="preset('injection')">NoSQL inject</button>
+              <button class="btn btn-secondary" onclick="preset('ddos')">DDoS burst</button>
             </div>
           </div>
 
@@ -751,6 +753,15 @@ function preset(name) {
       filter: '{"employee_id": "EMP-1002"}',
       payload: '{"role": "Senior Engineer"}'
     },
+    injection: {
+      op: 'READ', user: 'attacker',
+      filter: '{"$where": "sleep(2000)"}', payload: ''
+    },
+    ddos: {
+      op: 'READ', user: 'bot',
+      filter: '{"employee_id": "EMP-1001"}', payload: '',
+      _burst: true
+    },
   };
   const s = sets[name];
   if (!s) return;
@@ -780,6 +791,27 @@ async function runQuery() {
   if (!userId) { toast('⚠ user_id is required'); return; }
 
   setLoading(true);
+
+  // DDoS burst mode — fire 25 rapid requests to trigger rate limiting
+  if (s && s._burst) {
+    toast('Firing 25 rapid requests to trigger rate limit…');
+    const promises = Array.from({length: 25}, () =>
+      fetch(`${API}/query`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({query_type: op, query_filter: filter, user_id: userId}),
+      })
+    );
+    const results = await Promise.all(promises);
+    const blocked = results.filter(r => r.status === 403).length;
+    const last = await results[results.length - 1].json();
+    showResponse(results[results.length - 1].status, {
+      ...last,
+      _note: `Burst: ${results.length} requests fired, ${blocked} blocked (rate limit)`
+    });
+    setLoading(false); loadStats(); loadLogs();
+    return;
+  }
 
   const body = { query_type: op, query_filter: filter, user_id: userId };
   if (payload) body.update_payload = payload;
@@ -818,7 +850,7 @@ function showResponse(status, data) {
   // status badge
   if (blocked) {
     stEl.className = 'response-status blocked';
-    stEl.textContent = `🚫  HTTP ${status}  ·  BLOCKED`;
+    stEl.textContent = `🚫  HTTP ${status}  ·  BLOCKED${data.reason ? '  ·  ' + data.reason : ''}`;
   } else if (status >= 400) {
     stEl.className = 'response-status error';
     stEl.textContent = `⚠  HTTP ${status}  ·  ERROR`;
