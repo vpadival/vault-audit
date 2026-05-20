@@ -7,7 +7,13 @@ from typing import Any
 
 fake = Faker()
 _MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
-client: MongoClient[dict[str, Any]] = MongoClient(_MONGO_URI)
+# Bounded timeouts — fail fast if Mongo is unreachable instead of hanging ~30s.
+client: MongoClient[dict[str, Any]] = MongoClient(
+    _MONGO_URI,
+    serverSelectionTimeoutMS=2000,
+    connectTimeoutMS=2000,
+    socketTimeoutMS=5000,
+)
 db: Database[dict[str, Any]] = client["vault_audit_db"]
 
 # ─── Drop old data on each run (dev convenience) ──────────────────────────────

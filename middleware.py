@@ -45,7 +45,14 @@ log = logging.getLogger("vault-audit")
 # ─── MongoDB connection ───────────────────────────────────────────────────────
 # Override MONGO_URI in production; defaults to localhost for local dev.
 _MONGO_URI: str = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
-_client: MongoClient[dict[str, Any]] = MongoClient(_MONGO_URI)
+# Bounded timeouts — without these, pymongo blocks ~30s per call on an
+# unreachable server, which manifests as the dashboard spinner hanging.
+_client: MongoClient[dict[str, Any]] = MongoClient(
+    _MONGO_URI,
+    serverSelectionTimeoutMS=2000,   # fail fast if Mongo is unreachable
+    connectTimeoutMS=2000,           # TCP connect ceiling
+    socketTimeoutMS=5000,            # per-operation ceiling
+)
 _db: Database[dict[str, Any]] = _client["vault_audit_db"]
 
 
@@ -147,35 +154,39 @@ def _scan_filter(
 # Keyed by IP address. Resets when the process restarts (academic prototype).
 
 RATE_LIMIT_WINDOW_SECONDS = 60    # sliding window size
-RATE_LIMIT_MAX_REQUESTS   = 10    # max requests per IP per window
+RATE_LIMIT_MAX_REQUESTS   = 10    # max requests per (user, IP) per window
 
-# { ip: [timestamp, ...] }
-_rate_limit_store: dict[str, list[float]] = {}
+# { (user_id, ip): [timestamp, ...] }
+# Keyed on the pair so multiple users from a shared IP (e.g. all dashboard
+# users coming from 127.0.0.1) don't pollute each other's buckets.
+_rate_limit_store: dict[tuple[str, str], list[float]] = {}
 _rate_limit_lock = __import__("threading").Lock()
 
 
-def _check_rate_limit(ip_address: str) -> tuple[bool, int]:
+def _check_rate_limit(user_id: str, ip_address: str) -> tuple[bool, int]:
     """
     In-memory sliding-window rate limiter.
+    Keyed on (user_id, ip_address) so users on a shared IP don't share buckets.
     Returns (exceeded, request_count_in_window).
     Thread-safe via a module-level lock.
     """
+    key = (user_id, ip_address)
     now = time.time()
     window_start = now - RATE_LIMIT_WINDOW_SECONDS
 
     with _rate_limit_lock:
-        timestamps = _rate_limit_store.get(ip_address, [])
+        timestamps = _rate_limit_store.get(key, [])
         # Prune expired entries and append current timestamp
         timestamps = [t for t in timestamps if t >= window_start]
         timestamps.append(now)
-        _rate_limit_store[ip_address] = timestamps
+        _rate_limit_store[key] = timestamps
         count = len(timestamps)
 
     exceeded = count > RATE_LIMIT_MAX_REQUESTS
     if exceeded:
         log.warning(
-            "Rate limit exceeded for IP %s: %d requests in %ds window",
-            ip_address, count, RATE_LIMIT_WINDOW_SECONDS,
+            "Rate limit exceeded for user=%s ip=%s: %d requests in %ds window",
+            user_id, ip_address, count, RATE_LIMIT_WINDOW_SECONDS,
         )
     return exceeded, count
 
@@ -209,11 +220,13 @@ def extract_features(
         (has_sensitive == 1 or record_count > MAX_SAFE_COUNT)
     )
 
-    # Phase 5: injection detection
+    # Phase 5: injection detection (pure scan, no side effects)
     critical, suspicious, js_payload = _scan_filter(query_filter)
 
-    # Phase 5: rate limiting
-    rate_exceeded, req_count = _check_rate_limit(ip_address)
+    # Note: rate-limit check is owned by execute_query() pre-flight so it isn't
+    # double-counted. extract_features sets rate_limited=0 here unconditionally;
+    # by the time we reach this function, a rate-limited request has already
+    # been blocked and never gets scored.
 
     return {
         # ── numeric (SVM inputs) ──────────────────────
@@ -227,8 +240,8 @@ def extract_features(
         "injection_critical":    int(critical),
         "injection_suspicious":  int(suspicious),
         "js_payload":            int(js_payload),
-        "rate_limited":          int(rate_exceeded),
-        "request_count":         req_count,
+        "rate_limited":          0,    # always 0 here — see comment above
+        "request_count":         0,
         # ── metadata ─────────────────────────────────
         "query_type":            query_type,
         "filter_fields":         filter_fields,
@@ -554,21 +567,64 @@ def execute_query(
     """
     sensitive_data: Collection[dict[str, Any]] = _db["sensitive_data"]
 
-    # ── 1. Pre-run feature extraction (record_count needs a DB call) ──────────
-    # For READ we count matches before fetching; for others count affected docs.
-    pre_count: int = int(sensitive_data.count_documents(query_filter))
+    # ── 1. Pre-flight security checks (NO DB calls yet) ───────────────────────
+    # Critical injection operators ($where, $function, $accumulator, $expr) and
+    # JS-payload strings would otherwise reach MongoDB via count_documents — by
+    # then a malicious $where could already have executed server-side code. We
+    # scan the filter and check rate limits BEFORE touching the DB, so a
+    # malicious payload is blocked with zero round-trips.
+    critical, suspicious, js_payload = _scan_filter(query_filter)
+    rate_exceeded, _req_count = _check_rate_limit(user_id, ip_address)
+
+    if critical or js_payload or rate_exceeded:
+        # Instant block: build a minimal feature dict, score, audit, return.
+        # We can't call count_documents here (that's what we're avoiding), so
+        # record_count is reported as 0 for the audit entry — accurate because
+        # nothing was matched or returned.
+        _reasons: list[str] = []
+        if critical:      _reasons.append("injection:critical-operator")
+        if js_payload:    _reasons.append("injection:js-payload")
+        if rate_exceeded: _reasons.append("rate-limit-exceeded")
+        _threat_reason = ", ".join(_reasons)
+
+        log.warning(
+            "🚫  PRE-FLIGHT BLOCK user=%s ip=%s filter=%s reason=%s",
+            user_id, ip_address, query_filter, _threat_reason,
+        )
+        write_audit_log(
+            user_id, query_type, 0,
+            1.0, query_filter, ip_address, flagged=True,
+        )
+        return {
+            "status":       "blocked",
+            "threat_score": 1.0,
+            "flagged":      True,
+            "data":         None,
+            "record_count": 0,
+            "hash":         "",
+            "reason":       _threat_reason,
+        }
+
+    # ── 2. Pre-run feature extraction ─────────────────────────────────────────
+    # Filter is known safe at this point — count_documents is OK to call.
+    # READ needs an upfront count for record_count features; DELETE keeps it
+    # because bulk-delete is the most dangerous write and we want exceeds_limit
+    # to fire pre-flight. UPDATE/INSERT use their own returned counts and skip
+    # the extra round-trip.
+    if query_type in ("READ", "DELETE"):
+        pre_count: int = int(sensitive_data.count_documents(query_filter))
+    else:
+        pre_count = 0
 
     features = extract_features(query_type, query_filter, pre_count, user_id, ip_address)
     threat_score = score_threat(features)
     flagged      = threat_score >= 0.50
 
     log_level = logging.WARNING if flagged else logging.INFO
-    # Build a human-readable reason for logging / response
-    _reasons: list[str] = []
-    if features.get("injection_critical"):  _reasons.append("injection:critical-operator")
-    if features.get("js_payload"):          _reasons.append("injection:js-payload")
-    if features.get("injection_suspicious"):_reasons.append("injection:suspicious-operator")
-    if features.get("rate_limited"):        _reasons.append("rate-limit-exceeded")
+    # Build a human-readable reason for logging / response.
+    # Critical/js/rate-limit can't appear here — those were handled above.
+    _reasons = []
+    if features.get("injection_suspicious"): _reasons.append("injection:suspicious-operator")
     _threat_reason = ", ".join(_reasons) if _reasons else "exfil-pattern"
 
     log.log(
@@ -578,7 +634,7 @@ def execute_query(
         pre_count, threat_score, flagged, _threat_reason,
     )
 
-    # ── 2. Block if score is too high ─────────────────────────────────────────
+    # ── 3. Block if score is too high ─────────────────────────────────────────
     if threat_score >= BLOCK_THRESHOLD:
         write_audit_log(
             user_id, query_type, pre_count,

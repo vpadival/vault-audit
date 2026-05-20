@@ -31,6 +31,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from middleware import execute_query, get_db, verify_chain
+from pymongo.errors import PyMongoError
 import svm_engine                          # Phase 3
 
 # ─── App ─────────────────────────────────────────────────────────────────────
@@ -119,10 +120,18 @@ def dashboard() -> HTMLResponse:
 
 @app.get("/health", tags=["meta"])
 def health() -> dict[str, Any]:
-    """Liveness probe."""
+    """Liveness probe. Pings Mongo so the dashboard status dot reflects reality."""
+    db_ok = True
+    db_err: Union[str, None] = None
+    try:
+        get_db().command("ping")
+    except PyMongoError as exc:
+        db_ok = False
+        db_err = f"{type(exc).__name__}: {exc}"
     return {
-        "status":  "ok",
+        "status":  "ok" if db_ok else "degraded",
         "service": "vault-audit",
+        "db":      {"ok": db_ok, "error": db_err},
         "svm":     svm_engine.model_info(),    # Phase 3
     }
 
@@ -147,6 +156,15 @@ async def run_query(payload: QueryRequest, request: Request) -> Response:
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    except PyMongoError as exc:
+        # Mongo unreachable / timed out — fail fast with a clear message
+        # instead of letting it propagate as an opaque 500.
+        import logging
+        logging.getLogger("vault-audit").error("MongoDB unavailable: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Database unavailable: {type(exc).__name__}",
+        )
 
     if result["status"] == "blocked":
         return JSONResponse(
