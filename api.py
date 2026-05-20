@@ -128,7 +128,7 @@ def health() -> dict[str, Any]:
 
 
 @app.post("/query", tags=["queries"])
-def run_query(payload: QueryRequest, request: Request) -> Response:
+async def run_query(payload: QueryRequest, request: Request) -> Response:
     """
     Submit a query against `sensitive_data`.
     The middleware classifies it, logs it, and either returns results
@@ -137,12 +137,13 @@ def run_query(payload: QueryRequest, request: Request) -> Response:
     ip = _client_ip(request)
 
     try:
-        result = execute_query(
-            query_type     = payload.query_type,
-            query_filter   = payload.query_filter,
-            user_id        = payload.user_id,
-            ip_address     = ip,
-            update_payload = payload.update_payload,
+        result = await asyncio.to_thread(
+            execute_query,
+            payload.query_type,
+            payload.query_filter,
+            payload.user_id,
+            ip,
+            payload.update_payload,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -158,6 +159,7 @@ def run_query(payload: QueryRequest, request: Request) -> Response:
                 "hash":         "",
                 "data":         None,
                 "detail":       "Query blocked: threat score exceeds safe threshold.",
+                "reason":       result.get("reason", ""),
             },
         )
 
@@ -165,7 +167,7 @@ def run_query(payload: QueryRequest, request: Request) -> Response:
 
 
 @app.get("/audit/logs", tags=["audit"])
-def get_audit_logs(
+async def get_audit_logs(
     limit: int = 20,
     flagged_only: bool = False,
 ) -> list[dict[str, Any]]:
@@ -174,79 +176,84 @@ def get_audit_logs(
     - `limit`        — max entries to return (default 20, max 500)
     - `flagged_only` — when true, return only flagged (suspicious) logs
     """
-    # Clamp limit to prevent accidental full-collection dumps via the API.
-    limit = max(1, min(limit, 500))
-    db = get_db()
-    filt: dict[str, Any] = {"flagged": True} if flagged_only else {}
-    cursor = (
-        db["audit_logs"]
-        .find(filt, {"_id": 0})
-        .sort("timestamp", -1)
-        .limit(limit)
-    )
-    logs: list[dict[str, Any]] = []
-    for doc in cursor:
-        if "timestamp" in doc:
-            doc["timestamp"] = doc["timestamp"].isoformat()
-        logs.append(doc)
-    return logs
+    def _fetch() -> list[dict[str, Any]]:
+        lim = max(1, min(limit, 500))
+        db = get_db()
+        filt: dict[str, Any] = {"flagged": True} if flagged_only else {}
+        cursor = (
+            db["audit_logs"]
+            .find(filt, {"_id": 0})
+            .sort("timestamp", -1)
+            .limit(lim)
+        )
+        logs: list[dict[str, Any]] = []
+        for doc in cursor:
+            if "timestamp" in doc:
+                doc["timestamp"] = doc["timestamp"].isoformat()
+            logs.append(doc)
+        return logs
+
+    return await asyncio.to_thread(_fetch)
 
 
 @app.get("/audit/stats", tags=["audit"])
-def get_audit_stats() -> dict[str, Any]:
+async def get_audit_stats() -> dict[str, Any]:
     """High-level stats over all audit logs."""
-    db = get_db()
-    collection = db["audit_logs"]
-    total   = collection.count_documents({})
-    flagged = collection.count_documents({"flagged": True})
-    blocked = collection.count_documents({"threat_score": {"$gte": 0.85}})
+    def _fetch() -> dict[str, Any]:
+        db = get_db()
+        collection = db["audit_logs"]
+        total   = collection.count_documents({})
+        flagged = collection.count_documents({"flagged": True})
+        blocked = collection.count_documents({"threat_score": {"$gte": 0.85}})
+        pipeline: list[dict[str, Any]] = [
+            {"$group": {"_id": None, "avg_threat": {"$avg": "$threat_score"}}}
+        ]
+        agg = list(collection.aggregate(pipeline))
+        avg_threat = round(agg[0]["avg_threat"], 4) if agg else 0.0
+        return {
+            "total_queries":    total,
+            "flagged":          flagged,
+            "blocked":          blocked,
+            "avg_threat_score": avg_threat,
+        }
 
-    pipeline: list[dict[str, Any]] = [
-        {"$group": {"_id": None, "avg_threat": {"$avg": "$threat_score"}}}
-    ]
-    agg = list(collection.aggregate(pipeline))
-    avg_threat = round(agg[0]["avg_threat"], 4) if agg else 0.0
-
-    return {
-        "total_queries":    total,
-        "flagged":          flagged,
-        "blocked":          blocked,
-        "avg_threat_score": avg_threat,
-    }
+    return await asyncio.to_thread(_fetch)
 
 
 @app.get("/audit/verify", tags=["audit"])
-def get_audit_verify() -> dict[str, Any]:
+async def get_audit_verify() -> dict[str, Any]:
     """
     Phase 4: walk the audit log chain and verify integrity.
     Returns valid=true on a clean chain, or valid=false with the first
     broken seq and a human-readable reason.
     """
-    result = verify_chain()
+    result = await asyncio.to_thread(verify_chain)
     return dict(result)
 
 
 @app.get("/audit/attacks", tags=["audit"])
-def get_audit_attacks(limit: int = 50) -> list[dict[str, Any]]:
+async def get_audit_attacks(limit: int = 50) -> list[dict[str, Any]]:
     """
     Phase 5: return only audit entries that were flagged as injection or
     rate-limit attacks, newest first.
     """
-    limit = max(1, min(limit, 500))
-    db = get_db()
-    # threat_score >= 0.85 AND reason indicates attack type
-    cursor = (
-        db["audit_logs"]
-        .find({"threat_score": {"$gte": 0.85}}, {"_id": 0})
-        .sort("timestamp", -1)
-        .limit(limit)
-    )
-    logs: list[dict[str, Any]] = []
-    for doc in cursor:
-        if "timestamp" in doc:
-            doc["timestamp"] = doc["timestamp"].isoformat()
-        logs.append(doc)
-    return logs
+    def _fetch() -> list[dict[str, Any]]:
+        lim = max(1, min(limit, 500))
+        db = get_db()
+        cursor = (
+            db["audit_logs"]
+            .find({"threat_score": {"$gte": 0.85}}, {"_id": 0})
+            .sort("timestamp", -1)
+            .limit(lim)
+        )
+        logs: list[dict[str, Any]] = []
+        for doc in cursor:
+            if "timestamp" in doc:
+                doc["timestamp"] = doc["timestamp"].isoformat()
+            logs.append(doc)
+        return logs
+
+    return await asyncio.to_thread(_fetch)
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────

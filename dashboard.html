@@ -795,7 +795,7 @@ async function runQuery() {
   // DDoS burst mode — fire 25 rapid requests to trigger rate limiting
   if (s && s._burst) {
     toast('Firing 25 rapid requests to trigger rate limit…');
-    const promises = Array.from({length: 25}, () =>
+    const promises = Array.from({length: 8}, () =>
       fetch(`${API}/query`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -807,7 +807,7 @@ async function runQuery() {
     const last = await results[results.length - 1].json();
     showResponse(results[results.length - 1].status, {
       ...last,
-      _note: `Burst: ${results.length} requests fired, ${blocked} blocked (rate limit)`
+      _note: `Burst: ${results.length} requests fired, ${blocked} blocked by rate limit`
     });
     setLoading(false); loadStats(); loadLogs();
     return;
@@ -959,7 +959,7 @@ async function verifyChain() {
 checkHealth();
 loadStats();
 loadLogs();
-setInterval(checkHealth, 10_000);
+setInterval(checkHealth, 60_000);
 </script>
 </body>
 </html>

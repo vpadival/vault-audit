@@ -32,6 +32,8 @@ from pymongo.errors import DuplicateKeyError
 
 from baseline import THRESHOLDS
 import svm_engine                          # Phase 3
+import re
+import time
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -59,19 +61,150 @@ HIGH_RISK_OPS: set[str]    = set(THRESHOLDS["high_risk_ops"])
 MAX_SAFE_COUNT: int         = int(THRESHOLDS["max_safe_record_count"])
 
 
+# ─── Injection detection ─────────────────────────────────────────────────────
+
+# Operators that execute arbitrary server-side code — always block immediately.
+_CRITICAL_OPERATORS: frozenset[str] = frozenset({
+    "$where", "$function", "$accumulator", "$expr",
+})
+
+# Operators that are suspicious but sometimes legitimate (score bump only).
+_SUSPICIOUS_OPERATORS: frozenset[str] = frozenset({
+    "$gt", "$gte", "$lt", "$lte", "$ne", "$in", "$nin",
+    "$regex", "$text", "$mod",
+})
+
+# Patterns that suggest JS injection attempts inside string values.
+_JS_PATTERNS: re.Pattern[str] = re.compile(
+    r"(sleep\s*\(|function\s*\(|this\.|db\.|return\s+true|while\s*\(1\))",
+    re.IGNORECASE,
+)
+
+_MAX_FILTER_DEPTH = 5   # deeply nested objects are a red flag
+
+
+def _scan_filter(
+    obj: Any,
+    depth: int = 0,
+) -> tuple[bool, bool, bool]:
+    """
+    Recursively walk query_filter and return (critical, suspicious, js_payload).
+    - critical    : a code-execution operator was found → instant block
+    - suspicious  : an operator appears at the TOP level with no field wrapper
+                    (e.g. {"$gt": ""} is an injection attempt; {"salary": {"$gt": 0}}
+                    is normal field-scoped usage and is NOT flagged here)
+    - js_payload  : a string value matches JS injection patterns
+
+    Depth convention
+    ----------------
+    depth=0  : top-level keys of the filter dict  — suspicious operators flagged
+    depth=1  : values of field keys               — operators here are field-scoped (normal)
+    depth>=2 : deeper nesting                     — treated as suspicious if > _MAX_FILTER_DEPTH
+    """
+    if depth > _MAX_FILTER_DEPTH:
+        return False, True, False   # excessive nesting → suspicious
+
+    critical   = False
+    suspicious = False
+    js_payload = False
+
+    if isinstance(obj, dict):
+        k: str
+        v: Any
+        for k, v in obj.items():
+            if k in _CRITICAL_OPERATORS:
+                critical = True
+            elif k.startswith("$"):
+                # Suspicious only if at the top level (unscoped operator injection).
+                # Field-scoped operators like {"salary": {"$gt": 0}} appear at depth>=1
+                # and are normal MongoDB query syntax, not injection.
+                if depth == 0 and k in _SUSPICIOUS_OPERATORS:
+                    suspicious = True
+                elif depth == 0 and k not in _CRITICAL_OPERATORS:
+                    suspicious = True   # unknown top-level operator
+            c2, s2, j2 = _scan_filter(v, depth + 1)
+            critical   = critical   or c2
+            suspicious = suspicious or s2
+            js_payload = js_payload or j2
+
+    elif isinstance(obj, str):
+        if _JS_PATTERNS.search(obj):
+            js_payload = True
+
+    elif isinstance(obj, list):
+        item: Any
+        for item in obj:
+            c2, s2, j2 = _scan_filter(item, depth + 1)
+            critical   = critical   or c2
+            suspicious = suspicious or s2
+            js_payload = js_payload or j2
+
+    return critical, suspicious, js_payload
+
+
+# ─── Rate limiting (DDoS detection) ──────────────────────────────────────────
+
+RATE_LIMIT_WINDOW_SECONDS = 60    # sliding window size
+RATE_LIMIT_MAX_REQUESTS   = 5     # max requests per IP per window
+RATE_LIMIT_BLOCK_SCORE    = 1.0   # always block when rate limit exceeded
+
+
+def _check_rate_limit(ip_address: str) -> tuple[bool, int]:
+    """
+    Sliding-window rate limiter stored in MongoDB (rate_limits collection).
+    Returns (exceeded, request_count_in_window).
+    Uses a single document per IP with a list of timestamps; prunes old ones
+    on every call so the list never grows unboundedly.
+    """
+    rate_limits: Collection[dict[str, Any]] = _db["rate_limits"]
+    now = time.time()
+    window_start = now - RATE_LIMIT_WINDOW_SECONDS
+
+    # Atomically push the new timestamp and pull out expired ones.
+    rate_limits.update_one(
+        {"ip": ip_address},
+        {
+            "$push": {"timestamps": now},
+            "$pull": {"timestamps": {"$lt": window_start}},
+        },
+        upsert=True,
+    )
+
+    doc = rate_limits.find_one({"ip": ip_address}, {"timestamps": 1, "_id": 0})
+    timestamps: list[float] = doc.get("timestamps", []) if doc else []
+    count = len(timestamps)
+    exceeded = count > RATE_LIMIT_MAX_REQUESTS
+
+    if exceeded:
+        log.warning(
+            "Rate limit exceeded for IP %s: %d requests in %ds window",
+            ip_address, count, RATE_LIMIT_WINDOW_SECONDS,
+        )
+
+    return exceeded, count
+
+
 def extract_features(
     query_type: str,
     query_filter: dict[str, Any],
     record_count: int,
     user_id: str,
+    ip_address: str = "127.0.0.1",
 ) -> dict[str, Any]:
     """
     Returns a flat dict of named features.
     The SVM in Phase 3 will consume the numeric subset;
     the string fields are kept for logging / explainability.
+
+    Phase 5 additions
+    -----------------
+    * injection_critical : code-execution operator detected (instant block)
+    * injection_suspicious : comparison/regex operator in filter (score bump)
+    * js_payload         : JS-like string value detected in filter
+    * rate_limited       : IP exceeded request rate limit in sliding window
     """
     filter_fields: list[str] = list(query_filter.keys())
-    has_sensitive  = int(bool(SENSITIVE_FIELDS & set(filter_fields)))
+    has_sensitive   = int(bool(SENSITIVE_FIELDS & set(filter_fields)))
     is_empty_filter = int(len(filter_fields) == 0)
     is_high_risk_op = int(query_type in HIGH_RISK_OPS)
     exceeds_limit   = int(record_count > MAX_SAFE_COUNT)
@@ -80,18 +213,31 @@ def extract_features(
         (has_sensitive == 1 or record_count > MAX_SAFE_COUNT)
     )
 
+    # Phase 5: injection detection
+    critical, suspicious, js_payload = _scan_filter(query_filter)
+
+    # Phase 5: rate limiting
+    rate_exceeded, req_count = _check_rate_limit(ip_address)
+
     return {
         # ── numeric (SVM inputs) ──────────────────────
-        "record_count":     record_count,
-        "is_empty_filter":  is_empty_filter,
-        "has_sensitive":    has_sensitive,
-        "is_high_risk_op":  is_high_risk_op,
-        "exceeds_limit":    exceeds_limit,
-        "bulk_sensitive":   bulk_sensitive,
+        "record_count":          record_count,
+        "is_empty_filter":       is_empty_filter,
+        "has_sensitive":         has_sensitive,
+        "is_high_risk_op":       is_high_risk_op,
+        "exceeds_limit":         exceeds_limit,
+        "bulk_sensitive":        bulk_sensitive,
+        # ── Phase 5: attack detection ─────────────────
+        "injection_critical":    int(critical),
+        "injection_suspicious":  int(suspicious),
+        "js_payload":            int(js_payload),
+        "rate_limited":          int(rate_exceeded),
+        "request_count":         req_count,
         # ── metadata ─────────────────────────────────
-        "query_type":       query_type,
-        "filter_fields":    filter_fields,
-        "user_id":          user_id,
+        "query_type":            query_type,
+        "filter_fields":         filter_fields,
+        "user_id":               user_id,
+        "ip_address":            ip_address,
     }
 
 
@@ -128,6 +274,27 @@ def score_threat(features: dict[str, Any]) -> float:
     # this branch unreachable — removed.
     if features["bulk_sensitive"]:
         score += 0.05
+
+    # ── Phase 5: injection and rate-limit scoring ──────────────────────────
+    # Critical injection operators execute server-side code — instant block.
+    if features.get("injection_critical"):
+        score = 1.0
+        return score
+
+    # JS-like payload in a string value — instant block (code execution risk).
+    if features.get("js_payload"):
+        score = 1.0
+        return score
+
+    # Suspicious comparison/regex operators — flags the query; combine with
+    # exfil signals to push toward blocked.
+    if features.get("injection_suspicious"):
+        score += 0.50
+
+    # IP exceeded sliding-window rate limit — instant block.
+    if features.get("rate_limited"):
+        score = 1.0
+        return score
 
     return min(round(score, 4), 1.0)
 
@@ -395,15 +562,24 @@ def execute_query(
     # For READ we count matches before fetching; for others count affected docs.
     pre_count: int = int(sensitive_data.count_documents(query_filter))
 
-    features = extract_features(query_type, query_filter, pre_count, user_id)
+    features = extract_features(query_type, query_filter, pre_count, user_id, ip_address)
     threat_score = score_threat(features)
     flagged      = threat_score >= 0.50
 
     log_level = logging.WARNING if flagged else logging.INFO
+    # Build a human-readable reason for logging / response
+    _reasons: list[str] = []
+    if features.get("injection_critical"):  _reasons.append("injection:critical-operator")
+    if features.get("js_payload"):          _reasons.append("injection:js-payload")
+    if features.get("injection_suspicious"):_reasons.append("injection:suspicious-operator")
+    if features.get("rate_limited"):        _reasons.append("rate-limit-exceeded")
+    _threat_reason = ", ".join(_reasons) if _reasons else "exfil-pattern"
+
     log.log(
         log_level,
-        "query=%s user=%s filter=%s count=%d threat=%.2f flagged=%s",
-        query_type, user_id, query_filter, pre_count, threat_score, flagged,
+        "query=%s user=%s ip=%s filter=%s count=%d threat=%.4f flagged=%s reason=%s",
+        query_type, user_id, ip_address, query_filter,
+        pre_count, threat_score, flagged, _threat_reason,
     )
 
     # ── 2. Block if score is too high ─────────────────────────────────────────
@@ -420,6 +596,7 @@ def execute_query(
             "data":         None,
             "record_count": pre_count,
             "hash":         "",
+            "reason":       _threat_reason,
         }
 
     # ── 3. Execute the real MongoDB operation ─────────────────────────────────
