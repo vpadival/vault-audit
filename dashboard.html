@@ -770,6 +770,9 @@ function preset(name) {
   document.getElementById('user-id').value        = s.user;
   document.getElementById('query-filter').value   = s.filter;
   document.getElementById('update-payload').value = s.payload;
+  // Stash the burst flag so runQuery() can detect DDoS preset mode.
+  // Cleared on each preset load so other presets don't accidentally trigger it.
+  window._pendingBurst = !!s._burst;
 }
 
 // ── Run query ─────────────────────────────────────────────────────────────────
@@ -792,24 +795,34 @@ async function runQuery() {
 
   setLoading(true);
 
-  // DDoS burst mode — fire 25 rapid requests to trigger rate limiting
-  if (s && s._burst) {
-    toast('Firing 25 rapid requests to trigger rate limit…');
-    const promises = Array.from({length: 8}, () =>
-      fetch(`${API}/query`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({query_type: op, query_filter: filter, user_id: userId}),
-      })
-    );
-    const results = await Promise.all(promises);
-    const blocked = results.filter(r => r.status === 403).length;
-    const last = await results[results.length - 1].json();
-    showResponse(results[results.length - 1].status, {
-      ...last,
-      _note: `Burst: ${results.length} requests fired, ${blocked} blocked by rate limit`
-    });
-    setLoading(false); loadStats(); loadLogs();
+  // DDoS burst mode — fire 25 rapid requests to trigger rate limiting.
+  // The flag is set by loadPreset('ddos') and consumed here so a single
+  // burst doesn't repeat on the next click.
+  const burst = window._pendingBurst === true;
+  window._pendingBurst = false;
+
+  if (burst) {
+    try {
+      toast('Firing 25 rapid requests to trigger rate limit…');
+      const promises = Array.from({length: 8}, () =>
+        fetch(`${API}/query`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({query_type: op, query_filter: filter, user_id: userId}),
+        })
+      );
+      const results = await Promise.all(promises);
+      const blocked = results.filter(r => r.status === 403).length;
+      const last = await results[results.length - 1].json();
+      showResponse(results[results.length - 1].status, {
+        ...last,
+        _note: `Burst: ${results.length} requests fired, ${blocked} blocked by rate limit`
+      });
+    } catch (e) {
+      showError(e.message);
+    } finally {
+      setLoading(false); loadStats(); loadLogs();
+    }
     return;
   }
 
