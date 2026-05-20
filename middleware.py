@@ -143,44 +143,40 @@ def _scan_filter(
 
 
 # ─── Rate limiting (DDoS detection) ──────────────────────────────────────────
+# In-memory sliding window — no DB round-trips, zero latency overhead.
+# Keyed by IP address. Resets when the process restarts (academic prototype).
 
 RATE_LIMIT_WINDOW_SECONDS = 60    # sliding window size
-RATE_LIMIT_MAX_REQUESTS   = 5     # max requests per IP per window
-RATE_LIMIT_BLOCK_SCORE    = 1.0   # always block when rate limit exceeded
+RATE_LIMIT_MAX_REQUESTS   = 10    # max requests per IP per window
+
+# { ip: [timestamp, ...] }
+_rate_limit_store: dict[str, list[float]] = {}
+_rate_limit_lock = __import__("threading").Lock()
 
 
 def _check_rate_limit(ip_address: str) -> tuple[bool, int]:
     """
-    Sliding-window rate limiter stored in MongoDB (rate_limits collection).
+    In-memory sliding-window rate limiter.
     Returns (exceeded, request_count_in_window).
-    Uses a single document per IP with a list of timestamps; prunes old ones
-    on every call so the list never grows unboundedly.
+    Thread-safe via a module-level lock.
     """
-    rate_limits: Collection[dict[str, Any]] = _db["rate_limits"]
     now = time.time()
     window_start = now - RATE_LIMIT_WINDOW_SECONDS
 
-    # Atomically push the new timestamp and pull out expired ones.
-    rate_limits.update_one(
-        {"ip": ip_address},
-        {
-            "$push": {"timestamps": now},
-            "$pull": {"timestamps": {"$lt": window_start}},
-        },
-        upsert=True,
-    )
+    with _rate_limit_lock:
+        timestamps = _rate_limit_store.get(ip_address, [])
+        # Prune expired entries and append current timestamp
+        timestamps = [t for t in timestamps if t >= window_start]
+        timestamps.append(now)
+        _rate_limit_store[ip_address] = timestamps
+        count = len(timestamps)
 
-    doc = rate_limits.find_one({"ip": ip_address}, {"timestamps": 1, "_id": 0})
-    timestamps: list[float] = doc.get("timestamps", []) if doc else []
-    count = len(timestamps)
     exceeded = count > RATE_LIMIT_MAX_REQUESTS
-
     if exceeded:
         log.warning(
             "Rate limit exceeded for IP %s: %d requests in %ds window",
             ip_address, count, RATE_LIMIT_WINDOW_SECONDS,
         )
-
     return exceeded, count
 
 
