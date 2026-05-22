@@ -39,7 +39,7 @@ def colour(text: str, score: float, blocked: bool) -> str:
 
 # ─── Typed test case schema ───────────────────────────────────────────────────
 
-class TestCase(TypedDict):
+class QueryTestCase(TypedDict):
     label:          str
     expect_blocked: bool
     body:           dict[str, Any]

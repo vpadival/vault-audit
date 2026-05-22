@@ -1,20 +1,27 @@
 """
-middleware.py — Vault-Audit Phase 4
-====================================
+middleware.py — Vault-Audit (post-review revision)
+==================================================
 Sits between the caller and MongoDB. Every query goes through
 `execute_query()`, which:
-  1. Extracts a feature vector from the request
-  2. Scores threat likelihood with the trained SVM
-     (falls back to the Phase 2 rule-based scorer if the model is absent)
-  3. Writes a tamper-proof, hash-chained audit log entry
+  1. Scans both query_filter AND update_payload for injection (fix: S3)
+  2. Extracts features and scores threat likelihood with the SVM
+     (falls back to baseline.rule_score() if the model is absent)
+  3. Writes a chained, tamper-evident audit log entry
   4. Returns the real query result (or blocks on high threat)
 
-Phase 4 additions
------------------
-* Audit entries form a chain: each `integrity_hash` covers the previous
-  entry's hash plus a monotonic `seq` number.
-* `verify_chain()` walks the log and recomputes every hash, surfacing
-  the first break (tamper, missing entry, or out-of-order seq).
+Review fixes applied
+--------------------
+* S3 — update_payload and INSERT bodies now scanned with the same scanner
+       (mode='write') that previously only covered query_filter.
+* S5 — MongoClient is lazy-initialised via get_client(); module import no
+       longer opens a TCP connection. Tests can import this module without
+       a live Mongo.
+* S7 — _scan_filter is computed once in execute_query and passed into
+       extract_features as a pre-computed tuple. No more duplicate work.
+* S8 — rule scorer and weights live in baseline.py. This file imports
+       them. The "two-files-must-stay-in-sync" comment is gone.
+* S9 — Rate limiter keys on ip_address ONLY (was (user_id, ip_address)).
+       A caller-supplied user_id cannot create fresh buckets anymore.
 """
 
 from __future__ import annotations
@@ -22,6 +29,9 @@ import hashlib
 import json
 import logging
 import os
+import re
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, TypedDict
 
@@ -30,10 +40,13 @@ from pymongo.collection import Collection
 from pymongo.database import Database
 from pymongo.errors import DuplicateKeyError
 
-from baseline import THRESHOLDS
-import svm_engine                          # Phase 3
-import re
-import time
+from baseline import (
+    THRESHOLDS,
+    BLOCK_THRESHOLD,
+    FLAG_THRESHOLD,
+    rule_score,
+)
+import svm_engine
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -42,74 +55,89 @@ logging.basicConfig(
 )
 log = logging.getLogger("vault-audit")
 
-# ─── MongoDB connection ───────────────────────────────────────────────────────
-# Override MONGO_URI in production; defaults to localhost for local dev.
+# ─── MongoDB connection (lazy — fix S5) ───────────────────────────────────────
 _MONGO_URI: str = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
-# Bounded timeouts — without these, pymongo blocks ~30s per call on an
-# unreachable server, which manifests as the dashboard spinner hanging.
-_client: MongoClient[dict[str, Any]] = MongoClient(
-    _MONGO_URI,
-    serverSelectionTimeoutMS=2000,   # fail fast if Mongo is unreachable
-    connectTimeoutMS=2000,           # TCP connect ceiling
-    socketTimeoutMS=5000,            # per-operation ceiling
-)
-_db: Database[dict[str, Any]] = _client["vault_audit_db"]
+_client: MongoClient[dict[str, Any]] | None = None
+_client_lock = threading.Lock()
+
+
+def get_client() -> MongoClient[dict[str, Any]]:
+    """
+    Lazy MongoClient accessor. Opens the connection on first use, never at
+    import time. This lets tests and tooling import middleware without a
+    running Mongo (the previous module-level MongoClient(...) call would
+    block during import).
+    """
+    global _client
+    if _client is None:
+        with _client_lock:
+            if _client is None:  # double-checked locking
+                _client = MongoClient(
+                    _MONGO_URI,
+                    serverSelectionTimeoutMS=2000,
+                    connectTimeoutMS=2000,
+                    socketTimeoutMS=5000,
+                )
+    return _client
 
 
 def get_db() -> Database[dict[str, Any]]:
-    """Public accessor for the database — use this instead of _db directly."""
-    return _db
+    """Public accessor — use this everywhere instead of touching _client."""
+    return get_client()["vault_audit_db"]
 
 
-# ─── Feature extraction ───────────────────────────────────────────────────────
-
+# ─── Feature extraction constants ─────────────────────────────────────────────
 SENSITIVE_FIELDS: set[str] = set(THRESHOLDS["sensitive_fields"])
-HIGH_RISK_OPS: set[str]    = set(THRESHOLDS["high_risk_ops"])
-MAX_SAFE_COUNT: int         = int(THRESHOLDS["max_safe_record_count"])
+HIGH_RISK_OPS:    set[str] = set(THRESHOLDS["high_risk_ops"])
+MAX_SAFE_COUNT:   int      = int(THRESHOLDS["max_safe_record_count"])
 
 
 # ─── Injection detection ─────────────────────────────────────────────────────
-
-# Operators that execute arbitrary server-side code — always block immediately.
 _CRITICAL_OPERATORS: frozenset[str] = frozenset({
     "$where", "$function", "$accumulator", "$expr",
 })
-
-# Operators that are suspicious but sometimes legitimate (score bump only).
 _SUSPICIOUS_OPERATORS: frozenset[str] = frozenset({
     "$gt", "$gte", "$lt", "$lte", "$ne", "$in", "$nin",
     "$regex", "$text", "$mod",
 })
-
-# Patterns that suggest JS injection attempts inside string values.
+# Operators that are LEGITIMATE inside an update_payload — don't flag them
+# in write-mode scans. Anything outside this set is still scrutinised.
+_LEGITIMATE_UPDATE_OPERATORS: frozenset[str] = frozenset({
+    "$set", "$unset", "$inc", "$mul", "$min", "$max", "$rename",
+    "$currentDate", "$push", "$pull", "$addToSet", "$pop", "$each",
+})
 _JS_PATTERNS: re.Pattern[str] = re.compile(
     r"(sleep\s*\(|function\s*\(|this\.|db\.|return\s+true|while\s*\(1\))",
     re.IGNORECASE,
 )
-
-_MAX_FILTER_DEPTH = 5   # deeply nested objects are a red flag
+_MAX_FILTER_DEPTH = 5
 
 
 def _scan_filter(
     obj: Any,
     depth: int = 0,
+    mode: str = "read",
 ) -> tuple[bool, bool, bool]:
     """
-    Recursively walk query_filter and return (critical, suspicious, js_payload).
-    - critical    : a code-execution operator was found → instant block
-    - suspicious  : an operator appears at the TOP level with no field wrapper
-                    (e.g. {"$gt": ""} is an injection attempt; {"salary": {"$gt": 0}}
-                    is normal field-scoped usage and is NOT flagged here)
-    - js_payload  : a string value matches JS injection patterns
+    Recursively walk a MongoDB filter or write payload and return
+    (critical, suspicious, js_payload).
 
-    Depth convention
-    ----------------
-    depth=0  : top-level keys of the filter dict  — suspicious operators flagged
-    depth=1  : values of field keys               — operators here are field-scoped (normal)
-    depth>=2 : deeper nesting                     — treated as suspicious if > _MAX_FILTER_DEPTH
+    Parameters
+    ----------
+    mode : "read"  -> scanning a query_filter (top-level operators suspicious)
+           "write" -> scanning an update_payload or INSERT body
+                      (legitimate update operators like $set are allowed at
+                      the top level; critical operators still block; JS
+                      patterns in string values still block)
+
+    fix S3
+    ------
+    Previously this only ran on query_filter. UPDATE and INSERT bodies were
+    a free pass for injection — an attacker could ship
+    update_payload = {"$where": "..."} and the scanner would never see it.
     """
     if depth > _MAX_FILTER_DEPTH:
-        return False, True, False   # excessive nesting → suspicious
+        return False, True, False
 
     critical   = False
     suspicious = False
@@ -120,16 +148,20 @@ def _scan_filter(
         v: Any
         for k, v in obj.items():
             if k in _CRITICAL_OPERATORS:
+                # Code-execution operators are blocked in BOTH modes.
                 critical = True
             elif k.startswith("$"):
-                # Suspicious only if at the top level (unscoped operator injection).
-                # Field-scoped operators like {"salary": {"$gt": 0}} appear at depth>=1
-                # and are normal MongoDB query syntax, not injection.
-                if depth == 0 and k in _SUSPICIOUS_OPERATORS:
-                    suspicious = True
-                elif depth == 0 and k not in _CRITICAL_OPERATORS:
-                    suspicious = True   # unknown top-level operator
-            c2, s2, j2 = _scan_filter(v, depth + 1)
+                if mode == "write":
+                    # In write mode, legitimate update operators are fine;
+                    # anything else at the top level is suspicious.
+                    if depth == 0 and k not in _LEGITIMATE_UPDATE_OPERATORS:
+                        suspicious = True
+                else:  # read mode — original logic
+                    if depth == 0 and k in _SUSPICIOUS_OPERATORS:
+                        suspicious = True
+                    elif depth == 0 and k not in _CRITICAL_OPERATORS:
+                        suspicious = True
+            c2, s2, j2 = _scan_filter(v, depth + 1, mode)
             critical   = critical   or c2
             suspicious = suspicious or s2
             js_payload = js_payload or j2
@@ -141,7 +173,7 @@ def _scan_filter(
     elif isinstance(obj, list):
         item: Any
         for item in obj:
-            c2, s2, j2 = _scan_filter(item, depth + 1)
+            c2, s2, j2 = _scan_filter(item, depth + 1, mode)
             critical   = critical   or c2
             suspicious = suspicious or s2
             js_payload = js_payload or j2
@@ -149,66 +181,59 @@ def _scan_filter(
     return critical, suspicious, js_payload
 
 
-# ─── Rate limiting (DDoS detection) ──────────────────────────────────────────
-# In-memory sliding window — no DB round-trips, zero latency overhead.
-# Keyed by IP address. Resets when the process restarts (academic prototype).
+# ─── Rate limiting (fix S9 — key on IP only) ─────────────────────────────────
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_MAX_REQUESTS   = 10
 
-RATE_LIMIT_WINDOW_SECONDS = 60    # sliding window size
-RATE_LIMIT_MAX_REQUESTS   = 10    # max requests per (user, IP) per window
-
-# { (user_id, ip): [timestamp, ...] }
-# Keyed on the pair so multiple users from a shared IP (e.g. all dashboard
-# users coming from 127.0.0.1) don't pollute each other's buckets.
-_rate_limit_store: dict[tuple[str, str], list[float]] = {}
-_rate_limit_lock = __import__("threading").Lock()
+# Keyed on IP address ONLY. Previously keyed on (user_id, ip_address), but
+# user_id is caller-supplied and unauthenticated — an attacker could iterate
+# user_id values to get a fresh bucket per request.
+_rate_limit_store: dict[str, list[float]] = {}
+_rate_limit_lock = threading.Lock()
 
 
-def _check_rate_limit(user_id: str, ip_address: str) -> tuple[bool, int]:
+def _check_rate_limit(ip_address: str) -> tuple[bool, int]:
     """
-    In-memory sliding-window rate limiter.
-    Keyed on (user_id, ip_address) so users on a shared IP don't share buckets.
-    Returns (exceeded, request_count_in_window).
-    Thread-safe via a module-level lock.
+    Sliding-window rate limiter keyed on ip_address.
+    Returns (exceeded, request_count_in_window). Thread-safe.
     """
-    key = (user_id, ip_address)
     now = time.time()
     window_start = now - RATE_LIMIT_WINDOW_SECONDS
 
     with _rate_limit_lock:
-        timestamps = _rate_limit_store.get(key, [])
-        # Prune expired entries and append current timestamp
+        timestamps = _rate_limit_store.get(ip_address, [])
         timestamps = [t for t in timestamps if t >= window_start]
         timestamps.append(now)
-        _rate_limit_store[key] = timestamps
+        _rate_limit_store[ip_address] = timestamps
         count = len(timestamps)
 
     exceeded = count > RATE_LIMIT_MAX_REQUESTS
     if exceeded:
         log.warning(
-            "Rate limit exceeded for user=%s ip=%s: %d requests in %ds window",
-            user_id, ip_address, count, RATE_LIMIT_WINDOW_SECONDS,
+            "Rate limit exceeded for ip=%s: %d requests in %ds window",
+            ip_address, count, RATE_LIMIT_WINDOW_SECONDS,
         )
     return exceeded, count
 
 
+# ─── Feature extraction (fix S7 — scan results are now passed in) ────────────
 def extract_features(
     query_type: str,
     query_filter: dict[str, Any],
     record_count: int,
     user_id: str,
     ip_address: str = "127.0.0.1",
+    scan_result: tuple[bool, bool, bool] | None = None,
 ) -> dict[str, Any]:
     """
     Returns a flat dict of named features.
-    The SVM in Phase 3 will consume the numeric subset;
-    the string fields are kept for logging / explainability.
 
-    Phase 5 additions
-    -----------------
-    * injection_critical : code-execution operator detected (instant block)
-    * injection_suspicious : comparison/regex operator in filter (score bump)
-    * js_payload         : JS-like string value detected in filter
-    * rate_limited       : IP exceeded request rate limit in sliding window
+    fix S7
+    ------
+    Previously, this function called _scan_filter(query_filter) internally,
+    duplicating the work execute_query() had already done. The scan_result
+    can now be passed in as (critical, suspicious, js_payload). Falls back
+    to scanning if None is passed (preserves backwards-compat with tests).
     """
     filter_fields: list[str] = list(query_filter.keys())
     has_sensitive   = int(bool(SENSITIVE_FIELDS & set(filter_fields)))
@@ -220,29 +245,23 @@ def extract_features(
         (has_sensitive == 1 or record_count > MAX_SAFE_COUNT)
     )
 
-    # Phase 5: injection detection (pure scan, no side effects)
-    critical, suspicious, js_payload = _scan_filter(query_filter)
-
-    # Note: rate-limit check is owned by execute_query() pre-flight so it isn't
-    # double-counted. extract_features sets rate_limited=0 here unconditionally;
-    # by the time we reach this function, a rate-limited request has already
-    # been blocked and never gets scored.
+    if scan_result is None:
+        critical, suspicious, js_payload = _scan_filter(query_filter)
+    else:
+        critical, suspicious, js_payload = scan_result
 
     return {
-        # ── numeric (SVM inputs) ──────────────────────
         "record_count":          record_count,
         "is_empty_filter":       is_empty_filter,
         "has_sensitive":         has_sensitive,
         "is_high_risk_op":       is_high_risk_op,
         "exceeds_limit":         exceeds_limit,
         "bulk_sensitive":        bulk_sensitive,
-        # ── Phase 5: attack detection ─────────────────
         "injection_critical":    int(critical),
         "injection_suspicious":  int(suspicious),
         "js_payload":            int(js_payload),
-        "rate_limited":          0,    # always 0 here — see comment above
+        "rate_limited":          0,
         "request_count":         0,
-        # ── metadata ─────────────────────────────────
         "query_type":            query_type,
         "filter_fields":         filter_fields,
         "user_id":               user_id,
@@ -250,66 +269,31 @@ def extract_features(
     }
 
 
-# ─── Rule-based threat scorer (Phase 3 → SVM) ────────────────────────────────
-
+# ─── Threat scorer (fix S8 — delegates to baseline.rule_score) ───────────────
 def score_threat(features: dict[str, Any]) -> float:
     """
-    Phase 3: delegates to the calibrated SVM pipeline when the model is loaded.
-    Falls back to the original rule-based scorer automatically when the model
-    is not available (e.g. CI runs without svm_model.joblib, unit tests).
+    Delegates to the calibrated SVM when loaded; otherwise to the canonical
+    rule_score() in baseline.py. There is no longer a second copy of the
+    weights in this file.
     """
     if svm_engine.is_model_loaded():
         return svm_engine.svm_score(features)
 
-    # ── Fallback: original rule-based scorer (Phase 2) ────────────────────
-    score = 0.0
-
-    if features["exceeds_limit"]:      # record_count > MAX_SAFE_COUNT
-        score += 0.35
-
-    if features["is_empty_filter"]:    # no filter → full collection scan
-        score += 0.45
-
-    if features["is_high_risk_op"]:    # DELETE
-        score += 0.30
-
-    if features["has_sensitive"]:      # ssn / bank_account / salary in filter
-        score += 0.20
-
-    # bulk_sensitive: additive nudge when empty filter AND sensitive fields
-    # are both present (is_empty_filter already scored 0.45 above, but
-    # bulk-exfil of sensitive data warrants an extra push toward the block
-    # threshold).  The `not is_empty_filter` guard was incorrect — it made
-    # this branch unreachable — removed.
-    if features["bulk_sensitive"]:
-        score += 0.05
-
-    # ── Phase 5: injection and rate-limit scoring ──────────────────────────
-    # Critical injection operators execute server-side code — instant block.
-    if features.get("injection_critical"):
-        score = 1.0
-        return score
-
-    # JS-like payload in a string value — instant block (code execution risk).
-    if features.get("js_payload"):
-        score = 1.0
-        return score
-
-    # Suspicious comparison/regex operators — flags the query; combine with
-    # exfil signals to push toward blocked.
-    if features.get("injection_suspicious"):
-        score += 0.50
-
-    # IP exceeded sliding-window rate limit — instant block.
-    if features.get("rate_limited"):
-        score = 1.0
-        return score
-
-    return min(round(score, 4), 1.0)
+    return rule_score(
+        record_count         = features["record_count"],
+        is_empty_filter      = features["is_empty_filter"],
+        has_sensitive        = features["has_sensitive"],
+        is_high_risk_op      = features["is_high_risk_op"],
+        exceeds_limit        = features["exceeds_limit"],
+        bulk_sensitive       = features["bulk_sensitive"],
+        injection_critical   = features.get("injection_critical", 0),
+        js_payload           = features.get("js_payload", 0),
+        injection_suspicious = features.get("injection_suspicious", 0),
+        rate_limited         = features.get("rate_limited", 0),
+    )
 
 
-# ─── Integrity hash (Phase 4: chained) ────────────────────────────────────────
-
+# ─── Integrity hash ───────────────────────────────────────────────────────────
 GENESIS_PREV_HASH = "GENESIS"
 
 
@@ -323,11 +307,6 @@ def _make_hash(
     prev_hash: str,
     seq: int,
 ) -> str:
-    """
-    SHA-256 over the core log fields *plus* the previous entry's hash and
-    this entry's sequence number. Any retrospective edit, insert, or delete
-    anywhere in the log breaks every hash downstream from the tamper point.
-    """
     payload = json.dumps(
         {
             "timestamp":    timestamp.isoformat(),
@@ -344,13 +323,11 @@ def _make_hash(
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-# ─── Audit log writer (Phase 4: chained, retry on seq collision) ──────────────
-
+# ─── Audit log writer ─────────────────────────────────────────────────────────
 MAX_SEQ_RETRIES = 5
 
 
 def _last_entry(audit_logs: Collection[dict[str, Any]]) -> dict[str, Any] | None:
-    """Returns the entry with the highest seq, or None if the log is empty."""
     cursor = audit_logs.find({}, {"_id": 0, "seq": 1, "integrity_hash": 1}) \
                        .sort("seq", -1).limit(1)
     docs = list(cursor)
@@ -367,16 +344,9 @@ def write_audit_log(
     flagged: bool = False,
 ) -> str:
     """
-    Writes one chained entry to audit_logs. Returns the integrity hash.
-
-    Concurrency
-    -----------
-    `seq` has a unique index. If two writers race and pick the same next-seq,
-    one insert raises DuplicateKeyError; we re-read the tail and retry up to
-    MAX_SEQ_RETRIES times. In the single-process academic setup this is
-    essentially never exercised, but it makes the contract correct.
+    Writes one chained entry to audit_logs. Retries on seq collision.
     """
-    audit_logs: Collection[dict[str, Any]] = _db["audit_logs"]
+    audit_logs: Collection[dict[str, Any]] = get_db()["audit_logs"]
 
     for attempt in range(MAX_SEQ_RETRIES):
         tail = _last_entry(audit_logs)
@@ -387,9 +357,7 @@ def write_audit_log(
             next_seq  = int(tail["seq"]) + 1
             prev_hash = str(tail["integrity_hash"])
 
-        # MongoDB / BSON stores datetimes at millisecond precision. Truncate
-        # microseconds before hashing so the write-time hash matches what
-        # verify_chain() will recompute after reading the entry back.
+        # Truncate microseconds (BSON only stores millisecond precision)
         now = datetime.now(timezone.utc)
         ts  = now.replace(microsecond=(now.microsecond // 1000) * 1000)
 
@@ -399,24 +367,21 @@ def write_audit_log(
         )
 
         try:
-            audit_logs.insert_one(
-                {
-                    "seq":            next_seq,
-                    "timestamp":      ts,
-                    "user_id":        user_id,
-                    "query_type":     query_type,
-                    "record_count":   int(record_count),
-                    "threat_score":   float(threat_score),
-                    "integrity_hash": integrity_hash,
-                    "prev_hash":      prev_hash,
-                    "query_filter":   query_filter,
-                    "ip_address":     ip_address,
-                    "flagged":        flagged,
-                }
-            )
+            audit_logs.insert_one({
+                "seq":            next_seq,
+                "timestamp":      ts,
+                "user_id":        user_id,
+                "query_type":     query_type,
+                "record_count":   int(record_count),
+                "threat_score":   float(threat_score),
+                "integrity_hash": integrity_hash,
+                "prev_hash":      prev_hash,
+                "query_filter":   query_filter,
+                "ip_address":     ip_address,
+                "flagged":        flagged,
+            })
             return integrity_hash
         except DuplicateKeyError:
-            # Another writer beat us to this seq — re-read tail and try again.
             log.warning(
                 "audit_log seq collision at seq=%d (attempt %d/%d) — retrying",
                 next_seq, attempt + 1, MAX_SEQ_RETRIES,
@@ -428,8 +393,7 @@ def write_audit_log(
     )
 
 
-# ─── Chain verification (Phase 4) ─────────────────────────────────────────────
-
+# ─── Chain verification ───────────────────────────────────────────────────────
 class ChainVerification(TypedDict):
     valid:           bool
     total:           int
@@ -438,19 +402,7 @@ class ChainVerification(TypedDict):
 
 
 def verify_chain() -> ChainVerification:
-    """
-    Walks audit_logs in seq order and recomputes each entry's hash, checking
-    that:
-      * seq starts at 0 and is gap-free,
-      * prev_hash matches the previous entry's integrity_hash (or GENESIS for seq 0),
-      * the recomputed hash equals the stored integrity_hash.
-
-    Returns {valid, total, first_break_seq, reason}. On a clean chain,
-    first_break_seq and reason are None.
-    """
-    audit_logs: Collection[dict[str, Any]] = _db["audit_logs"]
-    # Project only the fields we need — avoids loading query_filter blobs
-    # for every entry when the collection is large.
+    audit_logs: Collection[dict[str, Any]] = get_db()["audit_logs"]
     _VERIFY_PROJECTION = {
         "_id": 0, "seq": 1, "timestamp": 1, "user_id": 1,
         "query_type": 1, "record_count": 1, "threat_score": 1,
@@ -466,7 +418,6 @@ def verify_chain() -> ChainVerification:
         total += 1
         seq = int(entry.get("seq", -1))
 
-        # ── 1. seq gap / out-of-order ──────────────────────────────────────
         if seq != expected_seq:
             return {
                 "valid":           False,
@@ -478,7 +429,6 @@ def verify_chain() -> ChainVerification:
                 ),
             }
 
-        # ── 2. prev_hash mismatch ──────────────────────────────────────────
         stored_prev = str(entry.get("prev_hash", ""))
         if stored_prev != expected_prev:
             return {
@@ -487,13 +437,11 @@ def verify_chain() -> ChainVerification:
                 "first_break_seq": seq,
                 "reason":          (
                     f"prev_hash mismatch at seq={seq}: "
-                    f"expected {expected_prev[:12]}…, found {stored_prev[:12]}…"
+                    f"expected {expected_prev[:12]}..., found {stored_prev[:12]}..."
                 ),
             }
 
-        # ── 3. recompute hash and compare ──────────────────────────────────
         ts_raw = entry["timestamp"]
-        # MongoDB returns datetimes as naive UTC; re-tag for hash determinism.
         if ts_raw.tzinfo is None:
             ts_raw = ts_raw.replace(tzinfo=timezone.utc)
         recomputed = _make_hash(
@@ -514,7 +462,7 @@ def verify_chain() -> ChainVerification:
                 "first_break_seq": seq,
                 "reason":          (
                     f"integrity_hash mismatch at seq={seq}: "
-                    f"recomputed {recomputed[:12]}…, stored {stored_hash[:12]}…"
+                    f"recomputed {recomputed[:12]}..., stored {stored_hash[:12]}..."
                 ),
             }
 
@@ -530,9 +478,6 @@ def verify_chain() -> ChainVerification:
 
 
 # ─── Public query executor ────────────────────────────────────────────────────
-
-BLOCK_THRESHOLD = 0.85   # scores at or above this are blocked outright
-
 QueryResult = dict[str, Any]
 
 
@@ -545,42 +490,28 @@ def execute_query(
 ) -> QueryResult:
     """
     The single entry-point for all DB operations.
-
-    Parameters
-    ----------
-    query_type     : "READ" | "UPDATE" | "DELETE" | "INSERT"
-    query_filter   : MongoDB filter dict  (e.g. {"employee_id": "EMP-1001"})
-    user_id        : caller identity string
-    ip_address     : caller IP (forwarded by FastAPI)
-    update_payload : required when query_type == "UPDATE"
-
-    Returns
-    -------
-    {
-        "status":       "ok" | "blocked",
-        "threat_score": float,
-        "flagged":      bool,
-        "data":         list[dict] | None,   # None when blocked
-        "record_count": int,
-        "hash":         str,
-    }
+    Returns a dict with status, threat_score, flagged, data, record_count, hash.
     """
-    sensitive_data: Collection[dict[str, Any]] = _db["sensitive_data"]
+    sensitive_data: Collection[dict[str, Any]] = get_db()["sensitive_data"]
 
     # ── 1. Pre-flight security checks (NO DB calls yet) ───────────────────────
-    # Critical injection operators ($where, $function, $accumulator, $expr) and
-    # JS-payload strings would otherwise reach MongoDB via count_documents — by
-    # then a malicious $where could already have executed server-side code. We
-    # scan the filter and check rate limits BEFORE touching the DB, so a
-    # malicious payload is blocked with zero round-trips.
-    critical, suspicious, js_payload = _scan_filter(query_filter)
-    rate_exceeded, _req_count = _check_rate_limit(user_id, ip_address)
+    # Scan query_filter (read mode).
+    f_critical, f_suspicious, f_js = _scan_filter(query_filter, mode="read")
+
+    # fix S3: scan update_payload too. Critical operators and JS patterns are
+    # blocked in writes; legitimate update operators ($set, $inc, ...) are
+    # allowed via the "write" mode.
+    p_critical = p_js = False
+    if update_payload is not None:
+        p_critical, _p_susp, p_js = _scan_filter(update_payload, mode="write")
+
+    critical   = f_critical   or p_critical
+    js_payload = f_js         or p_js
+    suspicious = f_suspicious
+
+    rate_exceeded, _req_count = _check_rate_limit(ip_address)
 
     if critical or js_payload or rate_exceeded:
-        # Instant block: build a minimal feature dict, score, audit, return.
-        # We can't call count_documents here (that's what we're avoiding), so
-        # record_count is reported as 0 for the audit entry — accurate because
-        # nothing was matched or returned.
         _reasons: list[str] = []
         if critical:      _reasons.append("injection:critical-operator")
         if js_payload:    _reasons.append("injection:js-payload")
@@ -588,8 +519,9 @@ def execute_query(
         _threat_reason = ", ".join(_reasons)
 
         log.warning(
-            "🚫  PRE-FLIGHT BLOCK user=%s ip=%s filter=%s reason=%s",
-            user_id, ip_address, query_filter, _threat_reason,
+            "PRE-FLIGHT BLOCK user=%s ip=%s filter=%s payload_present=%s reason=%s",
+            user_id, ip_address, query_filter,
+            update_payload is not None, _threat_reason,
         )
         write_audit_log(
             user_id, query_type, 0,
@@ -606,25 +538,23 @@ def execute_query(
         }
 
     # ── 2. Pre-run feature extraction ─────────────────────────────────────────
-    # Filter is known safe at this point — count_documents is OK to call.
-    # READ needs an upfront count for record_count features; DELETE keeps it
-    # because bulk-delete is the most dangerous write and we want exceeds_limit
-    # to fire pre-flight. UPDATE/INSERT use their own returned counts and skip
-    # the extra round-trip.
     if query_type in ("READ", "DELETE"):
         pre_count: int = int(sensitive_data.count_documents(query_filter))
     else:
         pre_count = 0
 
-    features = extract_features(query_type, query_filter, pre_count, user_id, ip_address)
+    # fix S7: pass the scan tuple we already computed instead of re-scanning.
+    features = extract_features(
+        query_type, query_filter, pre_count, user_id, ip_address,
+        scan_result=(critical, suspicious, js_payload),
+    )
     threat_score = score_threat(features)
-    flagged      = threat_score >= 0.50
+    flagged      = threat_score >= FLAG_THRESHOLD
 
     log_level = logging.WARNING if flagged else logging.INFO
-    # Build a human-readable reason for logging / response.
-    # Critical/js/rate-limit can't appear here — those were handled above.
     _reasons = []
-    if features.get("injection_suspicious"): _reasons.append("injection:suspicious-operator")
+    if features.get("injection_suspicious"):
+        _reasons.append("injection:suspicious-operator")
     _threat_reason = ", ".join(_reasons) if _reasons else "exfil-pattern"
 
     log.log(
@@ -640,7 +570,7 @@ def execute_query(
             user_id, query_type, pre_count,
             threat_score, query_filter, ip_address, flagged=True,
         )
-        log.warning("🚫  BLOCKED query from user=%s  threat=%.2f", user_id, threat_score)
+        log.warning("BLOCKED query from user=%s threat=%.2f", user_id, threat_score)
         return {
             "status":       "blocked",
             "threat_score": threat_score,
@@ -651,7 +581,7 @@ def execute_query(
             "reason":       _threat_reason,
         }
 
-    # ── 3. Execute the real MongoDB operation ─────────────────────────────────
+    # ── 4. Execute the real MongoDB operation ─────────────────────────────────
     data: list[dict[str, Any]] | None = None
     actual_count = pre_count
 
@@ -676,7 +606,7 @@ def execute_query(
         sensitive_data.insert_one(update_payload)
         actual_count = 1
 
-    # ── 4. Write audit log ────────────────────────────────────────────────────
+    # ── 5. Write audit log ────────────────────────────────────────────────────
     integrity_hash = write_audit_log(
         user_id, query_type, actual_count,
         threat_score, query_filter, ip_address, flagged,

@@ -694,6 +694,18 @@ function fmtTime(iso) {
   return iso.replace('T', ' ').slice(0, 19);
 }
 
+// ── XSS hardening (fix S2) ────────────────────────────────────────────────────
+// All audit-log fields (user_id, query_type, ...) originate from caller-supplied
+// POST bodies and are stored verbatim. Anywhere we interpolate them into HTML
+// with innerHTML, route through escapeHtml() to neutralise <script>, on*= and
+// other HTML metacharacters.
+function escapeHtml(value) {
+  if (value === null || value === undefined) return '—';
+  return String(value).replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+
 // ── Health ────────────────────────────────────────────────────────────────────
 
 async function checkHealth() {
@@ -928,12 +940,15 @@ function renderLogs(logs) {
     const pillCls  = blocked ? 'pill-blocked' : flagged ? 'pill-warn' : 'pill-ok';
     const pillTxt  = blocked ? 'blocked' : flagged ? 'flagged' : 'ok';
     const time     = fmtTime(e.timestamp ?? '');
+    // fix S2: every interpolated field is escaped. seq/score are server-typed
+    // numerics but pass through escapeHtml defensively in case the API ever
+    // returns a string.
     return `<tr>
-      <td style="color:var(--muted)">${e.seq ?? '—'}</td>
-      <td style="color:var(--muted)">${time}</td>
-      <td style="color:var(--text-bright)">${e.user_id ?? '—'}</td>
-      <td>${e.query_type ?? '—'}</td>
-      <td><span class="score-chip">${score}</span></td>
+      <td style="color:var(--muted)">${escapeHtml(e.seq ?? '—')}</td>
+      <td style="color:var(--muted)">${escapeHtml(time)}</td>
+      <td style="color:var(--text-bright)">${escapeHtml(e.user_id ?? '—')}</td>
+      <td>${escapeHtml(e.query_type ?? '—')}</td>
+      <td><span class="score-chip">${escapeHtml(score)}</span></td>
       <td><span class="pill ${pillCls}">${pillTxt}</span></td>
     </tr>`;
   }).join('');
@@ -948,22 +963,25 @@ async function verifyChain() {
     const r = await fetch(`${API}/audit/verify`);
     const d = await r.json();
     if (d.valid) {
+      // fix S2: escape server-supplied fields. d.total is numeric but defense-in-depth.
       el.innerHTML = `
         <span class="chain-icon">✅</span>
         <div>
           <div style="color:var(--accent);font-size:13px;font-weight:500">Chain valid</div>
-          <div class="chain-meta">${d.total} entries verified · no tampering detected</div>
+          <div class="chain-meta">${escapeHtml(d.total)} entries verified · no tampering detected</div>
         </div>`;
     } else {
+      // d.reason is a server-built string but may include data derived from
+      // caller-supplied fields (e.g. via query_filter). Always escape.
       el.innerHTML = `
         <span class="chain-icon">❌</span>
         <div>
-          <div style="color:var(--accent2);font-size:13px;font-weight:500">Chain broken at seq ${d.first_break_seq}</div>
-          <div class="chain-meta">${d.reason ?? 'Unknown reason'} · ${d.total} entries checked</div>
+          <div style="color:var(--accent2);font-size:13px;font-weight:500">Chain broken at seq ${escapeHtml(d.first_break_seq)}</div>
+          <div class="chain-meta">${escapeHtml(d.reason ?? 'Unknown reason')} · ${escapeHtml(d.total)} entries checked</div>
         </div>`;
     }
   } catch (e) {
-    el.innerHTML = `<span class="chain-icon">⚠️</span><div style="color:var(--warn);font-size:12px">${e.message}</div>`;
+    el.innerHTML = `<span class="chain-icon">⚠️</span><div style="color:var(--warn);font-size:12px">${escapeHtml(e.message)}</div>`;
   }
 }
 
