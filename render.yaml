@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: vault-audit
+    runtime: python
+    plan: free
+    branch: main
+    buildCommand: "pip install -r requirements.txt && python train_svm.py"
+    startCommand: "python db_setup.py && python api.py"
+    envVars:
+      - key: MONGO_URI
+        sync: false          # set this manually in the Render dashboard (Atlas connection string)
+      - key: RENDER
+        value: "true"
+      - key: PYTHON_VERSION
+        value: "3.14.3"       # matches the Python 3.14 this project targets

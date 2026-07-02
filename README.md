@@ -81,6 +81,21 @@ pip install fastapi uvicorn pymongo scikit-learn joblib faker numpy requests pyt
 
 ---
 
+## Deploying (Render)
+
+This repo ships with a `render.yaml` blueprint, so it deploys as a single web service.
+
+1. Push this repo to GitHub.
+2. Create a free [MongoDB Atlas](https://www.mongodb.com/cloud/atlas/register) cluster (or use a Render-hosted Mongo instance backed by a persistent disk) and grab its connection string.
+3. On Render: **New → Blueprint**, point it at this repo. Render will read `render.yaml` automatically.
+4. In the service's Environment tab, set `MONGO_URI` to your Atlas/Mongo connection string (this is the one variable `render.yaml` leaves for you to fill in manually, since it's a secret).
+5. Deploy. The build step installs dependencies and trains the SVM model (`train_svm.py`, which needs no DB); the start step seeds the database (`db_setup.py`) and launches the API (`api.py`), which now binds to `0.0.0.0:$PORT` in production.
+6. Once live, the dashboard is served at `https://<your-service>.onrender.com/dashboard` — it calls the API same-origin, so no extra config is needed there.
+
+Notes:
+- **Vercel** isn't a good fit for this project: Vercel's Python support is serverless functions, which conflicts with this app's persistent Mongo connection and in-memory SVM model loaded at startup.
+- **GitHub Pages** can't run this at all — it only serves static files, and this app is a live FastAPI + MongoDB service.
+
 ## Running
 
 ### 1. Initialise the database

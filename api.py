@@ -277,11 +277,18 @@ async def get_audit_attacks(limit: int = 50) -> list[dict[str, Any]]:
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import os
     import uvicorn
+
+    # In production (Render, etc.) PORT is injected by the platform and the
+    # app must bind to 0.0.0.0. Locally it falls back to 127.0.0.1:8000 with
+    # auto-reload, same as before.
+    is_prod = os.environ.get("RENDER") is not None or os.environ.get("ENV") == "production"
+
     uvicorn.run(
         "api:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=True,
+        host="0.0.0.0" if is_prod else "127.0.0.1",
+        port=int(os.environ.get("PORT", 8000)),
+        reload=not is_prod,
         loop="asyncio",
     )
